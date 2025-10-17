@@ -7,7 +7,7 @@ const App = () => {
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<{url: string | null; name: string; type: string}[]>([]);
   const [difficulty, setDifficulty] = useState('normal'); // 'normal' or 'hard'
-  const [loading, setLoading] = useState(false);
+  const [loading,setLoading] = useState(false);
   const [quiz, setQuiz] = useState(null);
   const [userAnswers, setUserAnswers] = useState({});
   const [submitted, setSubmitted] = useState(false);
@@ -107,7 +107,11 @@ const App = () => {
       }
     } catch (e) {
       console.error(e);
-      setError(e.message || "An error occurred while generating the quiz. Please check your connection and try again.");
+      let errorMessage = e.message || "An error occurred while generating the quiz. Please check your connection and try again.";
+      if (errorMessage.includes("504") || errorMessage.toLowerCase().includes('timeout')) {
+        errorMessage = "Quiz generation timed out, which can happen with large or complex files. Please try again, perhaps with a smaller image or less content.";
+      }
+      setError(errorMessage);
     } finally {
       setLoading(false);
     }
