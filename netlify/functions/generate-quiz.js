@@ -10,7 +10,7 @@ exports.handler = async function (event) {
   }
 
   try {
-    const { lessonText, uploadedFiles, difficulty } = JSON.parse(event.body);
+    const { lessonText, uploadedFiles, difficulty, numberOfQuestions } = JSON.parse(event.body);
 
     if (!lessonText && (!uploadedFiles || uploadedFiles.length === 0)) {
        return {
@@ -32,10 +32,11 @@ exports.handler = async function (event) {
         }
     };
 
+    const numQuestions = numberOfQuestions || 5;
     const difficultyPrompt = difficulty === 'hard'
       ? "Make the questions very challenging, requiring deep analysis, synthesis of information, and critical thinking. Go beyond simple recall."
-      : "";
-    const prompt = `Generate a multiple-choice quiz with 4-5 questions from the following lesson material. For each question, provide 4 options and clearly indicate the correct answer. Ensure the correct answer is one of the provided options. ${difficultyPrompt}`;
+      : "The questions should be straightforward and test basic understanding.";
+    const prompt = `Generate a multiple-choice quiz with exactly ${numQuestions} questions from the following lesson material. For each question, provide 4 options and clearly indicate the correct answer. Ensure the correct answer is one of the provided options. ${difficultyPrompt}`;
 
     let contents;
     if (uploadedFiles && uploadedFiles.length > 0) {

@@ -1,11 +1,57 @@
-import React, { useState, useCallback, useMemo, useEffect } from "react";
+import React, { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
+
+declare const pdfjsLib: any;
+
+// Helper function to decode base64 string to Uint8Array
+function decode(base64: string) {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+// Helper function to decode raw PCM audio data into an AudioBuffer
+async function decodeAudioData(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number,
+  numChannels: number,
+): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
+
+
+const ProgressBar = ({ progress, text }: { progress: number; text: string }) => (
+    <div className="progress-bar-container">
+        <div className="progress-bar-text">{text}</div>
+        <div className="progress-bar-background">
+            <div 
+                className="progress-bar-fill" 
+                style={{ width: `${progress}%` }}
+            ></div>
+        </div>
+    </div>
+);
 
 const App = () => {
   const [inputType, setInputType] = useState('text');
   const [lessonText, setLessonText] = useState('');
-  const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
-  const [previews, setPreviews] = useState<{url: string | null; name: string; type: string}[]>([]);
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<{url: string | null; name: string; type: string} | null>(null);
   const [difficulty, setDifficulty] = useState('normal'); // 'normal' or 'hard'
   const [loading,setLoading] = useState(false);
   const [quiz, setQuiz] = useState(null);
@@ -13,23 +59,82 @@ const App = () => {
   const [submitted, setSubmitted] = useState(false);
   const [showConfetti, setShowConfetti] = useState(false);
   const [error, setError] = useState('');
+  
+  const [isParsing, setIsParsing] = useState(false);
+  const [parsingProgress, setParsingProgress] = useState(0);
+  const [generationProgress, setGenerationProgress] = useState(0);
+  const [pdfPages, setPdfPages] = useState<string[]>([]);
+  const [selectedPages, setSelectedPages] = useState<Set<number>>(new Set());
+  const [numberOfQuestions, setNumberOfQuestions] = useState(5);
+
+  const [isGeneratingAudio, setIsGeneratingAudio] = useState(false);
+  const [audioError, setAudioError] = useState('');
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   useEffect(() => {
-    const newPreviews = uploadedFiles.map(file => ({
-        url: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
-        name: file.name,
-        type: file.type,
-    }));
-    setPreviews(newPreviews);
+    // Initialize AudioContext on mount
+    audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+    return () => {
+        audioContextRef.current?.close();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!uploadedFile) {
+        setPreview(null);
+        return;
+    }
+    const newPreview = {
+        url: uploadedFile.type.startsWith('image/') ? URL.createObjectURL(uploadedFile) : null,
+        name: uploadedFile.name,
+        type: uploadedFile.type,
+    };
+    setPreview(newPreview);
 
     return () => {
-        newPreviews.forEach(p => {
-            if (p.url) {
-                URL.revokeObjectURL(p.url);
-            }
-        });
+        if (newPreview.url) {
+            URL.revokeObjectURL(newPreview.url);
+        }
     };
-  }, [uploadedFiles]);
+  }, [uploadedFile]);
+
+  useEffect(() => {
+    let content = '';
+    if (uploadedFile && pdfPages.length > 0) {
+        content = Array.from(selectedPages).map(i => pdfPages[i]).join(' ');
+    } else if (lessonText) {
+        content = lessonText;
+    }
+    const wordCount = content.split(/\s+/).filter(Boolean).length;
+    if (wordCount > 0) {
+      const suggestedQuestions = Math.min(20, Math.max(3, Math.floor(wordCount / 150)));
+      setNumberOfQuestions(suggestedQuestions);
+    } else {
+      setNumberOfQuestions(5);
+    }
+  }, [lessonText, selectedPages, pdfPages, uploadedFile]);
+  
+  useEffect(() => {
+    let interval: number | undefined;
+    if (loading) {
+        interval = window.setInterval(() => {
+            setGenerationProgress(prev => {
+                if (prev >= 95) {
+                    if(interval) clearInterval(interval);
+                    return 95;
+                }
+                // Simulate slower progress as it nears completion
+                const increment = prev > 80 ? Math.random() * 1.5 : Math.random() * 5;
+                return Math.min(prev + increment, 95);
+            });
+        }, 400);
+    }
+
+    return () => {
+        if (interval) clearInterval(interval);
+    };
+  }, [loading]);
+
 
   const fileToBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
@@ -40,52 +145,185 @@ const App = () => {
     });
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
-    if (files.length > 0) {
-      setUploadedFiles(prev => [...prev, ...files]);
-      setLessonText(''); // Clear text input when files are added
-      setError('');
+  const parsePdf = async (file: File) => {
+    setIsParsing(true);
+    setError('');
+    setParsingProgress(0);
+    try {
+        const arrayBuffer = await file.arrayBuffer();
+        const loadingTask = pdfjsLib.getDocument(arrayBuffer);
+        
+        loadingTask.onProgress = (progressData: { loaded: number; total: number }) => {
+            setParsingProgress(Math.round((progressData.loaded / progressData.total) * 100));
+        };
+        
+        const pdf = await loadingTask.promise;
+        const numPages = pdf.numPages;
+        const pagesText: string[] = [];
+        for (let i = 1; i <= numPages; i++) {
+            const page = await pdf.getPage(i);
+            const textContent = await page.getTextContent();
+            const pageText = textContent.items.map((item: any) => item.str).join(' ');
+            pagesText.push(pageText);
+        }
+        setPdfPages(pagesText);
+        setSelectedPages(new Set(Array.from({ length: pagesText.length }, (_, i) => i)));
+    } catch (e) {
+        console.error("Error parsing PDF:", e);
+        setError("Could not read the PDF file. It might be corrupted or protected.");
+        setUploadedFile(null);
+    } finally {
+        setIsParsing(false);
+        setTimeout(() => setParsingProgress(0), 500);
     }
   };
 
-  const handleRemoveFile = (indexToRemove: number) => {
-    setUploadedFiles(prev => prev.filter((_, index) => index !== indexToRemove));
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setUploadedFile(file);
+      setLessonText(''); 
+      setError('');
+      setAudioError('');
+      setPdfPages([]);
+      setSelectedPages(new Set());
+      if (file.type === 'application/pdf') {
+        parsePdf(file);
+      }
+    }
+  };
+
+  const handleRemoveFile = () => {
+    setUploadedFile(null);
+    setPdfPages([]);
+    setSelectedPages(new Set());
   };
   
-  const handleTextChange = (e) => {
+  const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       setLessonText(e.target.value);
-      if (uploadedFiles.length > 0) { // Clear files if user starts typing
-        setUploadedFiles([]);
+      if (uploadedFile) {
+        handleRemoveFile();
       }
       setError('');
+      setAudioError('');
   }
 
-  const generateQuiz = async () => {
-    if (!lessonText && uploadedFiles.length === 0) {
-      setError("Please provide some lesson material first.");
-      return;
+  const handlePageSelect = (pageIndex: number) => {
+    setSelectedPages(prev => {
+        const newSet = new Set(prev);
+        if (newSet.has(pageIndex)) {
+            newSet.delete(pageIndex);
+        } else {
+            newSet.add(pageIndex);
+        }
+        return newSet;
+    });
+  };
+
+  const toggleSelectAllPages = () => {
+    if (selectedPages.size === pdfPages.length) {
+        setSelectedPages(new Set());
+    } else {
+        setSelectedPages(new Set(Array.from({ length: pdfPages.length }, (_, i) => i)));
     }
+  }
+  
+  const handleListen = async () => {
+    setIsGeneratingAudio(true);
+    setAudioError('');
+    setError('');
+
+    try {
+        let textToSynthesize = lessonText;
+        if (uploadedFile?.type === 'application/pdf') {
+            if (selectedPages.size === 0) {
+                setAudioError("Please select at least one page to listen to.");
+                setIsGeneratingAudio(false);
+                return;
+            }
+            textToSynthesize = Array.from(selectedPages).sort((a, b) => a - b).map(i => pdfPages[i]).join('\n\n');
+        }
+
+        const response = await fetch('/.netlify/functions/generate-speech', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: textToSynthesize }),
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ error: `HTTP error! status: ${response.status}` }));
+            throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+        }
+
+        const { audioContent } = await response.json();
+        
+        if (!audioContent) {
+             throw new Error("No audio content received.");
+        }
+
+        if (!audioContextRef.current) {
+            throw new Error("Audio context not available.");
+        }
+        
+        if (audioContextRef.current.state === 'suspended') {
+            await audioContextRef.current.resume();
+        }
+
+        const audioContext = audioContextRef.current;
+        const audioBuffer = await decodeAudioData(
+            decode(audioContent),
+            audioContext,
+            24000,
+            1,
+        );
+        
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        source.start();
+
+    } catch (e) {
+        console.error(e);
+        setAudioError(e.message || "An error occurred while generating audio.");
+    } finally {
+        setIsGeneratingAudio(false);
+    }
+  };
+
+
+  const generateQuiz = async () => {
     setLoading(true);
+    setGenerationProgress(0);
     setQuiz(null);
     setSubmitted(false);
     setUserAnswers({});
     setError('');
+    setAudioError('');
 
     try {
-      let payload: { lessonText?: string; uploadedFiles?: { data: string; mimeType: string }[]; difficulty: string; };
+      let payload: any;
+      let finalLessonText = lessonText;
 
-      if (uploadedFiles.length > 0) {
-        const filesData = await Promise.all(
-          uploadedFiles.map(async (file) => ({
-            data: await fileToBase64(file),
-            mimeType: file.type,
-          }))
-        );
-        payload = { uploadedFiles: filesData, difficulty };
+      if (uploadedFile) {
+        if (uploadedFile.type === 'application/pdf') {
+          if (selectedPages.size === 0) {
+            setError("Please select at least one page for the quiz.");
+            setLoading(false);
+            return;
+          }
+          finalLessonText = Array.from(selectedPages).sort((a,b) => a - b).map(i => pdfPages[i]).join('\n\n');
+          payload = { lessonText: finalLessonText, difficulty, numberOfQuestions };
+        } else { // It's an image
+          const fileData = {
+            data: await fileToBase64(uploadedFile),
+            mimeType: uploadedFile.type,
+          };
+          payload = { uploadedFiles: [fileData], difficulty, numberOfQuestions };
+        }
       } else {
-        payload = { lessonText, difficulty };
+        payload = { lessonText: finalLessonText, difficulty, numberOfQuestions };
       }
+
 
       const response = await fetch('/.netlify/functions/generate-quiz', {
         method: 'POST',
@@ -114,6 +352,8 @@ const App = () => {
       setError(errorMessage);
     } finally {
       setLoading(false);
+      setGenerationProgress(100);
+      setTimeout(() => setGenerationProgress(0), 500);
     }
   };
 
@@ -137,18 +377,25 @@ const App = () => {
   const handleReset = () => {
     setInputType('text');
     setLessonText('');
-    setUploadedFiles([]);
+    setUploadedFile(null);
     setLoading(false);
     setQuiz(null);
     setUserAnswers({});
     setSubmitted(false);
     setShowConfetti(false);
     setError('');
+    setAudioError('');
     setDifficulty('normal');
+    setPdfPages([]);
+    setSelectedPages(new Set());
+    setNumberOfQuestions(5);
   };
 
-  const isGenerateDisabled = !lessonText && uploadedFiles.length === 0;
+  const isContentProvided = !!lessonText || !!uploadedFile;
+  const isGenerateDisabled = !isContentProvided || (uploadedFile?.type === 'application/pdf' && selectedPages.size === 0);
+  const isListenDisabled = isGenerateDisabled || (uploadedFile && uploadedFile.type.startsWith('image/'));
   const isSubmitDisabled = Object.keys(userAnswers).length !== (quiz?.length || 0);
+  const anyActionInProgress = isParsing || loading || isGeneratingAudio;
 
   return (
     <>
@@ -165,6 +412,8 @@ const App = () => {
           --error-color: #ff6b6b;
           --correct-color: #50fa7b;
           --incorrect-color: #ff5555;
+          --listen-color-start: #1D976C;
+          --listen-color-end: #93F9B9;
           --font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
         }
         *, *::before, *::after {
@@ -261,20 +510,23 @@ const App = () => {
             text-align: center;
         }
         input[type="file"] { display: none; }
-        .image-preview-grid {
-          display: grid;
-          grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+        .file-preview-container {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
           gap: 1rem;
-          width: 100%;
           padding: 1rem;
+          border: 1px solid var(--border-color-alpha);
+          border-radius: 12px;
+          background-color: rgba(0,0,0,0.2);
         }
-        .preview-item {
+        .file-preview {
           position: relative;
-          aspect-ratio: 1 / 1;
+          max-width: 150px;
         }
-        .preview-item img {
+        .file-preview img {
           width: 100%;
-          height: 100%;
+          height: auto;
           object-fit: cover;
           border-radius: 8px;
         }
@@ -283,8 +535,8 @@ const App = () => {
           flex-direction: column;
           justify-content: center;
           align-items: center;
-          width: 100%;
-          height: 100%;
+          width: 120px;
+          height: 120px;
           background-color: rgba(0,0,0,0.3);
           border-radius: 8px;
           padding: 10px;
@@ -292,54 +544,39 @@ const App = () => {
           word-break: break-word;
         }
         .pdf-preview svg {
-          width: 40px;
-          height: 40px;
-          margin-bottom: 8px;
-          fill: var(--text-color);
-          opacity: 0.8;
+          width: 50px; height: 50px; margin-bottom: 8px; fill: var(--text-color); opacity: 0.8;
         }
-        .pdf-preview span {
-          font-size: 12px;
-          opacity: 0.8;
-          display: -webkit-box;
-          -webkit-line-clamp: 2;
-          -webkit-box-orient: vertical;
-          overflow: hidden;
-        }
-        .remove-image-btn {
-          position: absolute;
-          top: -8px;
-          right: -8px;
-          background: var(--error-color);
+        .pdf-preview span { font-size: 13px; opacity: 0.8; }
+        .remove-file-btn {
+          background: var(--secondary-color);
           color: white;
-          border: 2px solid var(--background-start);
-          border-radius: 50%;
-          width: 28px;
-          height: 28px;
-          font-size: 18px;
-          font-weight: bold;
+          border: none;
+          border-radius: 8px;
+          padding: 0.5rem 1rem;
           cursor: pointer;
-          display: flex;
-          justify-content: center;
-          align-items: center;
-          line-height: 1;
-          padding: 0;
-          transition: transform 0.2s ease;
-          z-index: 10;
+          transition: background-color 0.2s;
         }
-        .remove-image-btn:hover { transform: scale(1.1); }
+        .remove-file-btn:hover { background: var(--primary-color); }
         
-        .difficulty-container {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            margin: 1.5rem 0 0;
+        .quiz-options {
+          margin-top: 1.5rem;
+          padding: 1.5rem;
+          background-color: rgba(0,0,0,0.2);
+          border-radius: 12px;
         }
-        .difficulty-label {
-            margin-bottom: 0.5rem;
-            font-weight: 500;
-            opacity: 0.8;
+        .options-title {
+          text-align: center;
+          font-size: 1.2rem;
+          font-weight: 600;
+          margin-top: 0;
+          margin-bottom: 1.5rem;
+          opacity: 0.9;
         }
+
+        .option-group { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+        .option-group:last-child { margin-bottom: 0; }
+        .option-label { font-weight: 500; opacity: 0.8; }
+
         .difficulty-toggle {
             display: flex;
             background-color: rgba(0,0,0,0.2);
@@ -347,144 +584,88 @@ const App = () => {
             padding: 4px;
             border: 1px solid var(--border-color-alpha);
         }
-        .difficulty-toggle label { position: relative; }
         .difficulty-toggle span {
-            padding: 0.5rem 1.5rem;
-            cursor: pointer;
-            border-radius: 16px;
-            transition: all 0.3s ease;
-            color: var(--text-color);
-            opacity: 0.7;
-            display: block;
+            padding: 0.5rem 1.5rem; cursor: pointer; border-radius: 16px; transition: all 0.3s ease; color: var(--text-color); opacity: 0.7; display: block;
         }
         .difficulty-toggle input { display: none; }
         .difficulty-toggle input:checked + span {
-            background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
-            color: white;
-            opacity: 1;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            background: linear-gradient(90deg, var(--primary-color), var(--secondary-color)); color: white; opacity: 1; box-shadow: 0 2px 10px rgba(0,0,0,0.3);
         }
+
+        .num-questions-container { display: flex; align-items: center; gap: 1rem; justify-content: flex-end; }
+        .num-questions-container input[type="range"] {
+          width: 120px;
+          accent-color: var(--primary-color);
+        }
+        .num-questions-value { font-weight: bold; min-width: 20px; text-align: right;}
+        
+        .page-selection-container {
+            margin-top: 1.5rem;
+            padding: 1.5rem;
+            background-color: rgba(0,0,0,0.2);
+            border-radius: 12px;
+        }
+        .page-selection-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+        .page-selection-header h4 { margin: 0; font-size: 1.1rem; }
+        .page-selection-header button { background: none; border: 1px solid var(--border-color-alpha); color: var(--text-color); padding: 0.4rem 0.8rem; border-radius: 8px; cursor: pointer; transition: background-color 0.2s; }
+        .page-selection-header button:hover { background-color: var(--surface-color-alpha); }
+        .page-selection-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 0.75rem; max-height: 200px; overflow-y: auto; padding-right: 10px; }
+        .page-selection-grid label { display: flex; align-items: center; background: var(--surface-color-alpha); padding: 0.5rem 0.8rem; border-radius: 8px; cursor: pointer; transition: background-color 0.2s; }
+        .page-selection-grid label:hover { background-color: rgba(255,255,255,0.15); }
+        .page-selection-grid input { margin-right: 0.5rem; accent-color: var(--primary-color); }
 
         .btn {
-          display: block;
-          width: 100%;
-          padding: 1rem;
-          font-size: 1.2rem;
-          font-weight: bold;
-          border: none;
-          border-radius: 12px;
-          cursor: pointer;
-          background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
-          color: white;
-          margin-top: 1.5rem;
-          background-size: 200% 100%;
-          transition: background-position 0.4s ease;
+          display: block; width: 100%; padding: 1rem; font-size: 1.2rem; font-weight: bold; border: none; border-radius: 12px; cursor: pointer; background: linear-gradient(90deg, var(--primary-color), var(--secondary-color)); color: white; background-size: 200% 100%; transition: background-position 0.4s ease;
         }
-        .btn:hover:not(:disabled) {
+        .btn:hover:not(:disabled) { background-position: 100% 0; }
+        .btn:disabled { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.5); cursor: not-allowed; }
+
+        .action-buttons {
+          display: flex;
+          gap: 1rem;
+          margin-top: 1.5rem;
+        }
+        .action-buttons .btn {
+          margin-top: 0;
+          flex: 1;
+        }
+        .listen-btn {
+          background: linear-gradient(90deg, var(--listen-color-start), var(--listen-color-end));
+          color: var(--background-start);
+        }
+        .listen-btn:hover:not(:disabled) {
           background-position: 100% 0;
         }
-        .btn:disabled {
-          background: rgba(255,255,255,0.1);
-          color: rgba(255,255,255,0.5);
-          cursor: not-allowed;
-        }
 
-        .loader {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 2rem;
-            flex-direction: column;
-        }
-        .spinner {
-            border: 4px solid rgba(255,255,255,0.2);
-            border-left-color: var(--secondary-color);
-            border-radius: 50%;
-            width: 50px;
-            height: 50px;
-            animation: spin 1s linear infinite;
-        }
+        .loader { display: flex; justify-content: center; align-items: center; padding: 2rem; flex-direction: column; gap: 1rem; }
+        .spinner { border: 4px solid rgba(255,255,255,0.2); border-left-color: var(--secondary-color); border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
+        
+        .progress-bar-container { width: 100%; }
+        .progress-bar-text { text-align: center; margin-bottom: 0.5rem; opacity: 0.9; }
+        .progress-bar-background { width: 100%; height: 10px; background-color: rgba(0,0,0,0.3); border-radius: 5px; overflow: hidden; }
+        .progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--primary-color), var(--secondary-color)); border-radius: 5px; transition: width 0.3s ease-out; }
 
         .quiz-container { margin-top: 2rem; animation: fadeIn 0.5s ease-out; }
-        .question-card {
-            margin-bottom: 1.5rem;
-            background-color: rgba(0,0,0,0.15);
-            padding: 1.5rem;
-            border-radius: 12px;
-            border: 1px solid var(--border-color-alpha);
-        }
+        .question-card { margin-bottom: 1.5rem; background-color: rgba(0,0,0,0.15); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border-color-alpha); }
         .question-card h3 { margin-top: 0; }
         .options-list { list-style: none; padding: 0; }
         .option-item { margin-bottom: 0.75rem; }
-        .option-item label {
-            display: block;
-            border: 1px solid transparent;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.2s;
-            background-color: rgba(255,255,255,0.05);
-        }
+        .option-item label { display: block; border: 1px solid transparent; border-radius: 8px; cursor: pointer; transition: all 0.2s; background-color: rgba(255,255,255,0.05); }
         .option-item input[type="radio"] { display: none; }
-        .option-item span {
-            display: flex;
-            align-items: center;
-            padding: 0.8rem 1rem;
-        }
-        .option-item span::before {
-            content: '';
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            border: 2px solid var(--border-color-alpha);
-            margin-right: 1rem;
-            transition: all 0.2s ease;
-        }
-        .option-item input:checked + span::before {
-            background-color: var(--primary-color);
-            border-color: var(--primary-color);
-            box-shadow: 0 0 5px var(--primary-color);
-        }
+        .option-item span { display: flex; align-items: center; padding: 0.8rem 1rem; }
+        .option-item span::before { content: ''; width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--border-color-alpha); margin-right: 1rem; transition: all 0.2s ease; }
+        .option-item input:checked + span::before { background-color: var(--primary-color); border-color: var(--primary-color); box-shadow: 0 0 5px var(--primary-color); }
         .option-item label:hover { background-color: rgba(255,255,255,0.1); }
         .submitted .option-item label { cursor: default; }
-        .submitted .option-item label.correct {
-            background-color: rgba(80, 250, 123, 0.15);
-            border-color: var(--correct-color);
-        }
-        .submitted .option-item label.incorrect {
-            background-color: rgba(255, 85, 85, 0.15);
-            border-color: var(--incorrect-color);
-        }
-        .submitted .option-item input.correct + span::before {
-            background-color: var(--correct-color);
-            border-color: var(--correct-color);
-            content: '✔';
-            color: black;
-            text-align: center;
-            font-size: 12px;
-            line-height: 18px;
-        }
-        .submitted .option-item input.incorrect + span::before {
-            background-color: var(--incorrect-color);
-            border-color: var(--incorrect-color);
-            content: '✖';
-            color: black;
-            text-align: center;
-            font-size: 12px;
-            line-height: 18px;
-        }
+        .submitted .option-item label.correct { background-color: rgba(80, 250, 123, 0.15); border-color: var(--correct-color); }
+        .submitted .option-item label.incorrect { background-color: rgba(255, 85, 85, 0.15); border-color: var(--incorrect-color); }
+        .submitted .option-item input.correct + span::before { background-color: var(--correct-color); border-color: var(--correct-color); content: '✔'; color: black; text-align: center; font-size: 12px; line-height: 18px; }
+        .submitted .option-item input.incorrect + span::before { background-color: var(--incorrect-color); border-color: var(--incorrect-color); content: '✖'; color: black; text-align: center; font-size: 12px; line-height: 18px; }
 
         .results-container { margin-top: 2rem; }
         .results-header { text-align: center; font-size: 1.5rem; margin-bottom: 1rem; }
-        .error-message {
-            color: var(--error-color);
-            background-color: rgba(255, 85, 85, 0.15);
-            border: 1px solid var(--error-color);
-            text-align: center;
-            margin-top: 1rem;
-            padding: 1rem;
-            border-radius: 8px;
-        }
+        .error-message { color: var(--error-color); background-color: rgba(255, 85, 85, 0.15); border: 1px solid var(--error-color); text-align: center; margin-top: 1rem; padding: 1rem; border-radius: 8px; }
         
         .confetti-container { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; overflow: hidden; z-index: 999; }
         .confetti { position: absolute; width: 10px; height: 10px; background-color: var(--primary-color); opacity: 0.7; animation: confetti-fall 5s linear forwards; }
@@ -496,78 +677,127 @@ const App = () => {
       <div className="container">
         <div className="header">
           <h1>🧠 Lesson Quiz Generator</h1>
-          <p>Paste text or upload files to test your knowledge!</p>
+          <p>Paste text or upload a file to test your knowledge!</p>
         </div>
         
         {!quiz && !loading && (
           <div className="input-container">
             <div className="tabs">
               <button className={`tab ${inputType === 'text' ? 'active' : ''}`} onClick={() => setInputType('text')}>Enter Text</button>
-              <button className={`tab ${inputType === 'file' ? 'active' : ''}`} onClick={() => setInputType('file')}>Upload Files</button>
+              <button className={`tab ${inputType === 'file' ? 'active' : ''}`} onClick={() => setInputType('file')}>Upload File</button>
             </div>
-            {inputType === 'text' ? (
+            {inputType === 'text' && (
               <textarea
                 placeholder="Paste your lesson notes here..."
                 value={lessonText}
                 onChange={handleTextChange}
               />
-            ) : (
-              <label className="file-input-wrapper">
-                <input type="file" accept="image/*,application/pdf" onChange={handleFileChange} multiple />
-                {previews.length > 0 ? (
-                    <div className="image-preview-grid">
-                      {previews.map((preview, index) => (
-                        <div key={`${preview.name}-${index}`} className="preview-item">
-                          {preview.url ? (
+            )}
+            {inputType === 'file' && (
+                <>
+                {!uploadedFile ? (
+                    <label className="file-input-wrapper">
+                        <input type="file" accept="image/*,application/pdf" onChange={handleFileChange} />
+                        <span>Click to upload an image or PDF of your notes</span>
+                    </label>
+                ) : (
+                    <div className="file-preview-container">
+                        <div className="file-preview">
+                        {preview?.url ? (
                             <img src={preview.url} alt={`Preview of ${preview.name}`} />
-                          ) : (
+                        ) : (
                             <div className="pdf-preview">
-                               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
-                               <span>{preview.name}</span>
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M20 2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8.5 7.5c0 .83-.67 1.5-1.5 1.5H9v2H7.5V7H10c.83 0 1.5.67 1.5 1.5v1zm5 2c0 .83-.67 1.5-1.5 1.5h-2.5V7H15c.83 0 1.5.67 1.5 1.5v3zm-2.5-2H15V8.5h-1.5v3zM4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6z"/></svg>
+                                <span>{pdfPages.length} Pages</span>
                             </div>
-                          )}
-                          <button
-                            onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleRemoveFile(index); }}
-                            className="remove-image-btn"
-                            aria-label={`Remove file ${preview.name}`}
-                          >&times;</button>
+                        )}
                         </div>
-                      ))}
+                        <button onClick={handleRemoveFile} className="remove-file-btn">Change File</button>
                     </div>
-                  ) : (
-                    <span>Click to upload image(s) or PDF(s) of your notes</span>
-                  )}
-              </label>
+                )}
+                </>
             )}
 
-            <div className="difficulty-container">
-              <div className="difficulty-label">Quiz Difficulty</div>
-              <div className="difficulty-toggle">
-                <label>
-                  <input type="radio" name="difficulty" value="normal" checked={difficulty === 'normal'} onChange={() => setDifficulty('normal')} />
-                  <span>Normal</span>
-                </label>
-                <label>
-                  <input type="radio" name="difficulty" value="hard" checked={difficulty === 'hard'} onChange={() => setDifficulty('hard')} />
-                  <span>Hard</span>
-                </label>
-              </div>
-            </div>
+            {isParsing && (
+                <div className="loader">
+                    <div className="spinner"></div>
+                    <ProgressBar progress={parsingProgress} text={`Parsing PDF... ${parsingProgress}%`} />
+                </div>
+            )}
 
-            <button className="btn" onClick={generateQuiz} disabled={isGenerateDisabled}>
-              Generate Quiz
-            </button>
+            {inputType === 'file' && pdfPages.length > 1 && !isParsing && (
+                <div className="page-selection-container">
+                    <div className="page-selection-header">
+                        <h4>Select Pages for Quiz</h4>
+                        <button onClick={toggleSelectAllPages}>{selectedPages.size === pdfPages.length ? 'Deselect' : 'Select'} All</button>
+                    </div>
+                    <div className="page-selection-grid">
+                        {pdfPages.map((_, index) => (
+                        <label key={index}>
+                            <input
+                            type="checkbox"
+                            checked={selectedPages.has(index)}
+                            onChange={() => handlePageSelect(index)}
+                            />
+                            Page {index + 1}
+                        </label>
+                        ))}
+                    </div>
+                </div>
+            )}
+            
+            {isContentProvided && !isParsing && (
+              <>
+                <div className="quiz-options">
+                    <h3 className="options-title">Quiz Options</h3>
+                    <div className="option-group">
+                        <div className="option-label">Difficulty</div>
+                        <div className="difficulty-toggle">
+                            <label><input type="radio" name="difficulty" value="normal" checked={difficulty === 'normal'} onChange={() => setDifficulty('normal')} /><span>Normal</span></label>
+                            <label><input type="radio" name="difficulty" value="hard" checked={difficulty === 'hard'} onChange={() => setDifficulty('hard')} /><span>Hard</span></label>
+                        </div>
+                    </div>
+                    <div className="option-group">
+                        <div className="option-label">Number of Questions</div>
+                        <div className="num-questions-container">
+                            <input type="range" min="3" max="20" value={numberOfQuestions} onChange={(e) => setNumberOfQuestions(Number(e.target.value))} />
+                            <span className="num-questions-value">{numberOfQuestions}</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div className="action-buttons">
+                    <button
+                      className="btn listen-btn"
+                      onClick={handleListen}
+                      disabled={isListenDisabled || anyActionInProgress}
+                      aria-label="Listen to the provided lesson text"
+                    >
+                      {isGeneratingAudio ? 'Synthesizing...' : 'Listen'}
+                    </button>
+                    <button
+                      className="btn"
+                      onClick={generateQuiz}
+                      disabled={isGenerateDisabled || anyActionInProgress}
+                    >
+                      Generate Quiz
+                    </button>
+                </div>
+              </>
+            )}
+
           </div>
         )}
 
         {loading && (
           <div className="loader">
             <div className="spinner"></div>
-            <p>Generating your quiz...</p>
+            <ProgressBar progress={generationProgress} text="Generating your quiz..." />
           </div>
         )}
         
         {error && <p className="error-message">{error}</p>}
+        {audioError && <p className="error-message">{audioError}</p>}
 
         {quiz && (
           <div className={`quiz-container ${submitted ? 'submitted' : ''}`}>
