@@ -50,8 +50,8 @@ This application is ready for deployment on Netlify.
     - Choose your GitHub repository.
 3.  **Configure Build Settings:**
     - The `netlify.toml` file included in this repository pre-configures the build settings. Netlify will automatically detect and use it.
-    - **Build command:** `echo 'No build step required'`
-    - **Publish directory:** `/` (root)
+    - **Build command:** (Leave blank or use `echo 'No build step required'`)
+    - **Publish directory:** `/` (or leave as is, as `netlify.toml` will handle it)
 4.  **Set Environment Variables:**
     - In the Netlify site settings, go to "Site configuration" > "Environment variables".
     - Add a new variable:
