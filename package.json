@@ -1,0 +1,6 @@
+{
+  "name": "lesson-quiz-generator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Your personal AI study buddy. Create lessons from text or files and generate quizzes to test your knowledge."
+}
