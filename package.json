@@ -4,7 +4,7 @@
   "private": true,
   "description": "Your personal AI study buddy. Create lessons from text or files and generate quizzes to test your knowledge.",
   "scripts": {
-    "build": "esbuild index.tsx --bundle --outfile=dist/index.js --jsx=automatic && cp index.html style.css manifest.json service-worker.js dist/"
+    "build": "esbuild index.tsx --bundle --outfile=dist/index.js --jsx=automatic --define:process.env.API_KEY='\"$API_KEY\"' && cp index.html style.css manifest.json service-worker.js dist/"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

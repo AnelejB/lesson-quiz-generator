@@ -282,11 +282,6 @@ const translations = {
 type Language = keyof typeof translations;
 const defaultLang: Language = 'en';
 
-const getInitialLanguage = (): Language => {
-    const browserLang = navigator.language.split('-')[0] as Language;
-    return translations[browserLang] ? browserLang : defaultLang;
-};
-
 interface LanguageContextType {
     language: Language;
     setLanguage: (lang: Language) => void;
@@ -299,6 +294,7 @@ const LanguageContext = createContext<LanguageContextType | undefined>(undefined
 const LanguageProvider = ({ children }: { children?: React.ReactNode }) => {
     const [language, setLanguageState] = useState<Language>(() => {
         try {
+            // Priority 1: Check for a language saved from a previous session.
             const storedLang = localStorage.getItem('lessonQuizLanguage');
             if (storedLang && storedLang in translations) {
                 return storedLang as Language;
@@ -306,7 +302,9 @@ const LanguageProvider = ({ children }: { children?: React.ReactNode }) => {
         } catch (e) {
             console.error("Could not read language from localStorage", e);
         }
-        return getInitialLanguage();
+        // Priority 2: Fallback to the default language ('en') if nothing is stored.
+        // Browser language detection has been removed to prioritize lesson content language.
+        return defaultLang;
     });
 
     const setLanguage = useCallback((lang: Language) => {
